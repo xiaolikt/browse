@@ -1091,9 +1091,10 @@ async fn upload(ctx: ToolContext, args: Value) -> Result<ToolOutput> {
                 ElementOr::Element(element) => element,
                 ElementOr::Status(_) => bail!("{} is not a file input (input[type=file]) or its label", target_label(&spec, &resolved.label)),
             };
-            set_files(&c.page, &input, &checked).await?;
+            let manner = set_files(&c.page, &input, &checked).await?;
             let mut out = Map::new();
             out.insert("target".into(), target_label(&spec, &resolved.label));
+            out.insert("manner".into(), json!(manner));
             out.insert("files".into(), json!(checked.iter().map(|p| std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()).collect::<Vec<_>>()));
             Ok(out)
         })
@@ -1138,13 +1139,48 @@ fn mime_type(path: &std::path::Path) -> &'static str {
     }
 }
 
-/// Puts files into a file input as in-memory File objects: browse reads them where it runs and sends the bytes,
-/// so it works when the browser is on another machine and without the extension's file URL access.
-async fn set_files(page: &Arc<TabPage>, input: &crate::page::Element, paths: &[String]) -> Result<()> {
+/// Hands the paths to the browser itself (`DOM.setFileInputFiles`): Chrome reads the files from disk, so the page
+/// gets real File objects with a trusted input and change, the bytes never travel through the relay, and there is no
+/// size limit. Needs the browser to see the same paths, which rules out a browser on another machine, and the
+/// extension to be allowed file access (Chrome answers "Not allowed" otherwise).
+async fn set_files_from_paths(page: &Arc<TabPage>, input: &crate::page::Element, paths: &[String]) -> Result<()> {
+    let described = page
+        .send("DOM.describeNode", json!({ "objectId": input.object_id }), input.session.as_deref())
+        .await
+        .map_err(|e| anyhow!("upload: {e}"))?;
+    let attributes: Vec<Value> = described["node"]["attributes"].as_array().cloned().unwrap_or_default();
+    let multiple = attributes.chunks(2).any(|pair| pair.first().and_then(Value::as_str) == Some("multiple"));
+    if paths.len() > 1 && !multiple {
+        bail!("upload: the file input takes a single file (it has no `multiple` attribute); pass one file");
+    }
+    page.send("DOM.setFileInputFiles", json!({ "files": paths, "objectId": input.object_id }), input.session.as_deref())
+        .await
+        .map_err(|e| anyhow!("upload: {e}"))?;
+    // The command answers before the page holds the files; read them back so a browser that could not resolve the
+    // paths falls through to the in-memory copy below instead of reporting a silent success.
+    let seen = page.call_element(input, "fileSizes", vec![], true).await.unwrap_or(Value::Null);
+    let sizes: Vec<u64> = seen
+        .as_array()
+        .map(|files| files.iter().filter_map(|f| f.get("size").and_then(Value::as_u64)).collect())
+        .unwrap_or_default();
+    let expected: Vec<u64> = paths.iter().filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len())).collect();
+    if sizes != expected {
+        bail!("upload: the browser did not take the files from disk (the input shows {sizes:?}, the files are {expected:?})");
+    }
+    Ok(())
+}
+
+/// Puts files into a file input: from disk when the browser can read the paths, otherwise as in-memory File objects
+/// that browse reads where it runs and sends, which also covers a browser on another machine and an extension
+/// without file access. Returns how the page got them.
+async fn set_files(page: &Arc<TabPage>, input: &crate::page::Element, paths: &[String]) -> Result<&'static str> {
     use base64::Engine;
     let mut total = 0u64;
     for path in paths {
         total += std::fs::metadata(path).map(|m| m.len()).map_err(|e| anyhow!("upload: {path}: {e}"))?;
+    }
+    if set_files_from_paths(page, input, paths).await.is_ok() {
+        return Ok("paths");
     }
     if total > MAX_UPLOAD_BYTES {
         bail!("upload: the files are {:.1} MB together; browse uploads at most {} MB per call", total as f64 / 1_048_576.0, MAX_UPLOAD_BYTES / 1_048_576);
@@ -1173,7 +1209,7 @@ async fn set_files(page: &Arc<TabPage>, input: &crate::page::Element, paths: &[S
     .await;
     match sent {
         Ok(status) => match status.as_str() {
-            Some("ok") => Ok(()),
+            Some("ok") => Ok("copy"),
             Some("not-multiple") => bail!("upload: the file input takes a single file (it has no `multiple` attribute); pass one file"),
             Some("disabled") => bail!("upload: the file input is disabled"),
             _ => bail!("upload: the page did not accept the files"),
@@ -1756,7 +1792,7 @@ fn dialog_schema() -> Value {
     )
 }
 
-const UPLOAD: &str = "Set the files of a file input (input[type=file], or its label) without opening the file chooser. files are absolute paths inside browse's file roots, on the machine browse runs on; browse reads them and hands the page in-memory copies (with input and change events), so the browser may be elsewhere. At most 50 MB per call.";
+const UPLOAD: &str = "Set the files of a file input (input[type=file], or its label) without opening the file chooser. files are absolute paths inside browse's file roots, on the machine browse runs on. When the browser can read those paths itself (it runs on the same machine and the extension is allowed file access) the files come from disk: the page gets real File objects, with a trusted input and change, and there is no size limit. Otherwise the bytes are sent to the page as in-memory copies (at most 50 MB per call), which also covers a browser on another machine. manner in the reply says which happened: paths or copy.";
 
 fn upload_schema() -> Value {
     object(

@@ -442,6 +442,10 @@
       if (target instanceof HTMLInputElement && target.type.toLowerCase() === "file") return target
       return "not-file-input"
     },
+    // The files a file input holds, as the page sees them: confirms a path upload really landed.
+    fileSizes(element) {
+      return Array.from(element.files || []).map((file) => ({ name: file.name, size: file.size }))
+    },
     // Uploads as in-memory files (like Playwright's setInputFiles with buffers): the bytes arrive in base64 chunks,
     // then become File objects assigned through a DataTransfer, with input and change events.
     uploadChunk(id, base64) {

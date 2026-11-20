@@ -315,8 +315,12 @@ async fn fill_uploads_keys_scroll_and_waits() {
     std::fs::write(&file, "hello").unwrap();
     let uploaded = h.json("upload", json!({ "selector": "#file", "files": [file.display().to_string()] })).await;
     assert_eq!(uploaded["files"][0], "upload.txt");
+    // A plain DevTools client may read the paths itself, so the page gets the file from disk.
+    assert_eq!(uploaded["manner"], "paths", "{uploaded}");
     let names = h.ok("eval", json!({ "expression": "document.getElementById('file').files[0].name" })).await;
     assert_eq!(names, "\"upload.txt\"");
+    let sizes = h.ok("eval", json!({ "expression": "document.getElementById('file').files[0].size" })).await;
+    assert_eq!(sizes, "5");
     h.err("upload", json!({ "selector": "#file", "files": ["/etc/passwd"] })).await;
 
     h.ok("type", json!({ "selector": "#q", "text": "rust lang", "submit": true })).await;
